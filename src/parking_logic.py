@@ -1,56 +1,102 @@
 from datetime import datetime
 from src.db import get_connection
 
-# ---------------- ENTRY ----------------
-def allocate_slot(plate_number):
+
+
+
+def allocate_slot(plate_number, vehicle_type):
+
+    print("allocate_slot() called")
+    print("Plate:", plate_number)
+    print("Vehicle Type:", vehicle_type)
+
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Check if vehicle already parked (no exit yet)
+    # ===============================
+    # Check if vehicle already parked
+    # ===============================
     cursor.execute(
         """
-        SELECT slot_id FROM vehicle_entries
-        WHERE plate_number=%s AND exit_time IS NULL
+        SELECT slot_id
+        FROM vehicle_entries
+        WHERE plate_number = %s
+        AND exit_time IS NULL
         """,
         (plate_number,)
     )
+
     if cursor.fetchone():
+        cursor.close()
         conn.close()
         return None, "Already Parked"
 
-    # Find free slot
+    # ===============================
+    # Find Available Slot
+    # ===============================
     cursor.execute(
-        "SELECT slot_id FROM parking_slots WHERE is_available=TRUE LIMIT 1"
+        """
+        SELECT slot_id
+        FROM parking_slots
+        WHERE is_available = TRUE
+        LIMIT 1
+        """
     )
+
     slot = cursor.fetchone()
 
     if not slot:
+        cursor.close()
         conn.close()
         return None, "Parking Full"
 
     slot_id = slot[0]
 
-    # Mark slot occupied
+    # ===============================
+    # Mark Slot Occupied
+    # ===============================
     cursor.execute(
-        "UPDATE parking_slots SET is_available=FALSE WHERE slot_id=%s",
+        """
+        UPDATE parking_slots
+        SET is_available = FALSE
+        WHERE slot_id = %s
+        """,
         (slot_id,)
     )
 
-    # Insert entry
+    # ===============================
+    # Insert Vehicle Entry
+    # ===============================
     cursor.execute(
         """
-        INSERT INTO vehicle_entries (plate_number, slot_id, entry_time)
-        VALUES (%s, %s, %s)
+        INSERT INTO vehicle_entries
+        (
+            plate_number,
+            vehicle_type,
+            slot_id,
+            entry_time
+        )
+        VALUES (%s, %s, %s, %s)
         """,
-        (plate_number, slot_id, datetime.now())
+        (
+            plate_number,
+            vehicle_type,
+            slot_id,
+            datetime.now()
+        )
     )
 
+    # ===============================
+    # Save Changes
+    # ===============================
     conn.commit()
+
+    cursor.close()
     conn.close()
 
+    print("Entry Successful")
+
     return slot_id, "Entry Successful"
-
-
 # ---------------- EXIT ----------------
 def release_slot(plate_number):
     conn = get_connection()
@@ -93,8 +139,8 @@ def release_slot(plate_number):
     )
 
     conn.commit()
+    cursor.close()
     conn.close()
-
     return slot_id, "Exit Successful"
 
 def get_dashboard_stats():
@@ -113,7 +159,7 @@ def get_dashboard_stats():
         WHERE exit_time IS NULL
     """)
     active = cursor.fetchall()
-
+    cursor.close()
     conn.close()
 
     return {
@@ -123,7 +169,6 @@ def get_dashboard_stats():
         "active": active
     }
 
-from src.db import get_connection
 
 def get_parking_layout():
     conn = get_connection()
@@ -147,3 +192,32 @@ def get_parking_layout():
     conn.close()
 
     return slots
+
+def get_vehicle_history():
+
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    cursor.execute("""
+        SELECT
+            vehicle_type,
+            plate_number,
+            slot_id,
+            entry_time,
+            exit_time,
+            TIMESTAMPDIFF(
+                MINUTE,
+                entry_time,
+                IFNULL(exit_time, NOW())
+            ) AS duration_minutes
+        FROM vehicle_entries
+        ORDER BY entry_time DESC
+        LIMIT 50
+    """)
+
+    history = cursor.fetchall()
+
+    cursor.close()
+    conn.close()
+
+    return history

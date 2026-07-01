@@ -154,7 +154,13 @@ body {
   color: rgba(255, 255, 255, 0.8);
 }
 
+.table tbody tr:hover{
 
+transform:scale(1.01);
+
+cursor:pointer;
+
+}
 
 .theme-btn {
   border: none;
@@ -364,6 +370,19 @@ body {
   background: #2563eb;
   color: white;
 }
+
+.vehicle-table thead th{
+
+position:sticky;
+
+top:0;
+
+background:#212529;
+
+z-index:10;
+
+}
+
 
 .vehicle-table tbody tr {
   transition: 0.3s ease;
@@ -713,4 +732,10 @@ body {
   100% {
     transform: scale(1);
   }
+}
+
+.camera-feed {
+    width: 100%;
+    border-radius: 15px;
+    object-fit: cover;
 }

@@ -7,7 +7,7 @@ from collections import deque, Counter
 from src.parking_logic import allocate_slot, release_slot
 
 # ================= MODELS =================
-vehicle_model = YOLO("models/vehicle_detector.pt")
+vehicle_model = YOLO("yolov8n.pt")
 plate_model = YOLO("models/plate_detector.pt")
 reader = easyocr.Reader(['en'], gpu=False)
 
@@ -67,6 +67,280 @@ def preprocess(img):
     return thresh
 
 # ================= MAIN FUNCTION =================
+def detect_plate(vehicle_roi):
+
+    plate_results = plate_model(
+        vehicle_roi,
+        conf=0.2,
+        verbose=False
+    )
+
+    plate_boxes = []
+
+    for plate in plate_results[0].boxes:
+        plate_boxes.append(plate)
+
+    print(f"Plates Found: {len(plate_boxes)}")
+
+    return plate_boxes
+
+# def extract_plate_text(plate_img):
+#     print("STEP 1")
+#     # Upscale image for better OCR
+#     plate_img = cv2.resize(
+#         plate_img,
+#         None,
+#         fx=3,
+#         fy=3,
+#         interpolation=cv2.INTER_CUBIC
+#     )
+#     print("STEP 2")
+#     gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+#     print("STEP 3")
+    
+
+#     if len(plate_buffer) == 0:
+#         return None
+
+#     plate = Counter(plate_buffer).most_common(1)[0][0]
+
+#     return plate
+
+def extract_plate_text(plate_img):
+
+    # ---------- Resize ----------
+    plate_img = cv2.resize(
+        plate_img,
+        None,
+        fx=3,
+        fy=3,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # ---------- Pre-processing ----------
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    _, thresh = cv2.threshold(
+        blur,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        2
+    )
+
+    variants = [
+        gray,
+        thresh,
+        adaptive
+    ]
+
+    detected_plates = []
+
+    # ---------- OCR ----------
+    for img in variants:
+
+        results = reader.readtext(
+            img,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        )
+
+        for (_, text, conf) in results:
+
+            cleaned = clean_text(text)
+
+            print(f"[OCR] {cleaned} ({conf:.2f})")
+
+            standard = STANDARD_REGEX.match(cleaned)
+            bh = BH_REGEX.match(cleaned)
+
+            if conf >= 0.40 and (standard or bh):
+
+                detected_plates.append(cleaned)
+
+    if len(detected_plates) == 0:
+        return None
+
+    final_plate = Counter(detected_plates).most_common(1)[0][0]
+
+    print(f"[FINAL OCR] {final_plate}")
+
+    return final_plate
+
+def process_parking_event(plate, vehicle_type, current_time):
+
+    mode = SYSTEM_STATE["mode"]
+
+    # ---------------- Duplicate Check ----------------
+    if plate in recent_vehicles:
+        if current_time - recent_vehicles[plate] < COOLDOWN:
+            return False
+
+    # ---------------- ENTRY ----------------
+    if mode == "ENTRY":
+
+        slot, message = allocate_slot(
+            plate,
+            vehicle_type
+        )
+
+        if slot:
+
+            last_event["plate"] = plate
+            last_event["slot"] = slot
+            last_event["mode"] = "ENTRY"
+            last_event["message"] = f"✅ ENTRY: {plate} → Slot {slot}"
+            last_event["timestamp"] = int(time.time() * 1000)
+
+            print(f"[ENTRY DONE] {plate}")
+
+    # ---------------- EXIT ----------------
+    else:
+
+        slot, message = release_slot(plate)
+
+        if slot:
+
+            last_event["plate"] = plate
+            last_event["slot"] = slot
+            last_event["mode"] = "EXIT"
+            last_event["message"] = f"✅ EXIT: {plate} → Slot {slot}"
+            last_event["timestamp"] = int(time.time() * 1000)
+
+            print(f"[EXIT DONE] {plate}")
+
+    recent_vehicles[plate] = current_time
+
+    return True
+
+def process_uploaded_image(image_path):
+
+    print("=" * 50)
+    print("PROCESS_UPLOADED_IMAGE CALLED")
+    print("Image Path:", image_path)
+    print("=" * 50)
+
+    frame = cv2.imread(image_path)
+
+    if frame is None:
+        return {
+            "success": False,
+            "message": "Unable to read image"
+        }
+
+    # Resize like live camera
+    frame = cv2.resize(frame, (640, 480))
+
+    # Detect Vehicles
+    vehicle_boxes = detect_vehicles(frame)
+
+    total_plates = 0
+
+    for vehicle in vehicle_boxes:
+
+        box = vehicle["box"]
+        vehicle_type = vehicle["type"]
+
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        vehicle_roi = frame[y1:y2, x1:x2]
+
+        if vehicle_roi.size == 0:
+            continue
+
+        plate_boxes = detect_plate(vehicle_roi)
+        final_plate = None
+
+        for plate in plate_boxes:
+
+            px1, py1, px2, py2 = map(int, plate.xyxy[0])
+
+            plate_roi = vehicle_roi[py1:py2, px1:px2]
+
+            if plate_roi.size == 0:
+                continue
+            print("Calling extract_plate_text()")
+            plate_text = extract_plate_text(plate_roi)
+            print("OCR Result:", plate_text)
+            if plate_text:
+
+                final_plate = plate_text
+
+                print(f"FINAL PLATE : {final_plate}")
+
+                if final_plate:
+
+                        mode = SYSTEM_STATE["mode"]
+
+                        process_parking_event(
+                            final_plate,
+                            vehicle_type,
+                            time.time()
+                        )
+
+        total_plates += len(plate_boxes)
+
+    print(f"Vehicles Found : {len(vehicle_boxes)}")
+    print(f"Plates Found   : {total_plates}")
+
+    return {
+    "success": True,
+    "vehicles": len(vehicle_boxes),
+    "plates": total_plates,
+    "plate_number": final_plate
+    }
+
+def detect_vehicles(frame):
+
+    results = vehicle_model(
+        frame,
+        conf=0.6,
+        imgsz=640,
+        verbose=False
+    )
+
+    vehicles = []
+    for box in results[0].boxes:
+
+        cls = int(box.cls[0])
+        conf = float(box.conf[0])
+
+        print(
+            f"Detected: {vehicle_model.names[cls]} | Confidence: {conf:.2f}"
+        )
+
+        # car, motorcycle, bus, truck
+        if cls in [2, 3, 5, 7] and conf >= 0.5:
+
+            vehicles.append({
+                "box": box,
+                "type": get_vehicle_type(cls)
+            })
+
+    print(f"Filtered Vehicles: {len(vehicles)}")
+
+    return vehicles
+
+def get_vehicle_type(class_id):
+
+    vehicle_map = {
+        2: "Car",
+        3: "Motorcycle",
+        5: "Bus",
+        7: "Truck"
+    }
+
+    return vehicle_map.get(class_id, "Unknown")
+
 def generate_frames():
     global last_vehicle_time, last_event
 
@@ -82,6 +356,7 @@ def generate_frames():
     print("[INFO] Camera started")
 
     while True:
+
         ret, frame = cap.read()
 
         if not ret:
@@ -94,105 +369,95 @@ def generate_frames():
         mode = SYSTEM_STATE["mode"]
 
         # ================= VEHICLE DETECTION =================
-        results = vehicle_model(frame, conf=0.2, imgsz=640, verbose=False)
-        boxes = results[0].boxes
+        vehicles = detect_vehicles(frame)
 
-        if len(boxes) > 0:
+        if vehicles:
             last_vehicle_time = current_time
-            print(f"[YOLO] Vehicles: {len(boxes)}")
+            print(f"[YOLO] Vehicles: {len(vehicles)}")
         else:
-            print("[YOLO] No detection")
+            print("[YOLO] No Detection")
 
-        # Skip if unstable
+        # Ignore temporary frame drops
         if current_time - last_vehicle_time > VEHICLE_HOLD_TIME:
             continue
 
-        for v in boxes:
-            x1, y1, x2, y2 = map(int, v.xyxy[0])
-            vehicle_roi = frame[y1:y2, x1:x2]
+        # ================= PROCESS EACH VEHICLE =================
+        for vehicle in vehicles:
 
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            box = vehicle["box"]
+            vehicle_type = vehicle["type"]
+
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            vehicle_roi = frame[y1:y2, x1:x2]
 
             if vehicle_roi.size == 0:
                 continue
 
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
             # ================= PLATE DETECTION =================
-            plate_results = plate_model(vehicle_roi, conf=0.2, verbose=False)
+            plate_boxes = detect_plate(vehicle_roi)
 
-            for p in plate_results[0].boxes:
-                px1, py1, px2, py2 = map(int, p.xyxy[0])
-                plate_img = vehicle_roi[py1:py2, px1:px2]
+            for plate_box in plate_boxes:
 
-                if plate_img.size == 0:
+                px1, py1, px2, py2 = map(int, plate_box.xyxy[0])
+
+                plate_roi = vehicle_roi[py1:py2, px1:px2]
+
+                if plate_roi.size == 0:
                     continue
 
-                processed = preprocess(plate_img)
-                ocr_results = reader.readtext(processed)
+                plate = extract_plate_text(plate_roi)
 
-                for (_, text, conf) in ocr_results:
-                    cleaned = clean_text(text)
+                if plate:
+                    print(f"[VALID PLATE] {plate}")
+                    plate_buffer.append(plate)
 
-                    print(f"[OCR RAW] {text} → CLEAN: {cleaned} ({conf:.2f})")
+            # ================= STABILIZATION =================
+            if len(plate_buffer) < 3:
+                continue
 
-                    # STRICT VALIDATION
-                    is_standard = STANDARD_REGEX.match(cleaned)
-                    is_bh = BH_REGEX.match(cleaned)
+            final_plate, freq = Counter(plate_buffer).most_common(1)[0]
 
-                    if conf > 0.4 and (is_standard or is_bh):
-                        print(f"[VALID PLATE] {cleaned}")
-                        plate_buffer.append(cleaned)
-                    else:
-                        print(f"[REJECTED] {cleaned}")
+            if freq < 2:
+                continue
 
-                # ================= STABILIZATION =================
-                if len(plate_buffer) >= 3:
-                    plate, freq = Counter(plate_buffer).most_common(1)[0]
+            print(f"[FINAL PLATE] {final_plate}")
 
-                    if freq >= 2:
-                        print(f"[FINAL PLATE] {plate}")
+            # Cooldown
+            process_parking_event(
+                final_plate,
+                vehicle_type,
+                current_time
+            )
 
-                        # Cooldown
-                        if plate in recent_vehicles:
-                            if current_time - recent_vehicles[plate] < COOLDOWN:
-                                continue
-
-                        # ================= ENTRY =================
-                        if mode == "ENTRY":
-                            slot, _ = allocate_slot(plate)
-                            if slot:
-                                last_event["plate"] = plate
-                                last_event["slot"] = slot
-                                last_event["mode"] = "ENTRY"
-                                last_event["message"] = f"✅ ENTRY: {plate} → Slot {slot}"
-                                last_event["timestamp"] = int(time.time() * 1000)
-
-                                print(f"[ENTRY DONE] {plate}")
-
-                        # ================= EXIT =================
-                        elif mode == "EXIT":
-                            slot, _ = release_slot(plate)
-                            if slot:
-                                last_event["plate"] = plate
-                                last_event["slot"] = slot
-                                last_event["mode"] = "EXIT"
-                                last_event["message"] = f"✅ EXIT: {plate} → Slot {slot}"
-                                last_event["timestamp"] = int(time.time() * 1000)
-
-                                print(f"[EXIT DONE] {plate}")
-
-                        recent_vehicles[plate] = current_time
-                        plate_buffer.clear()
+            plate_buffer.clear()
 
         # ================= UI =================
-        cv2.putText(frame, f"MODE: {mode}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        cv2.putText(
+            frame,
+            f"MODE: {mode}",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 0, 0),
+            2,
+        )
 
         _, buffer = cv2.imencode(".jpg", frame)
-        frame_bytes = buffer.tobytes()
 
         yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n'
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + buffer.tobytes()
+            + b"\r\n"
         )
 
     cap.release()
